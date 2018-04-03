@@ -9,7 +9,10 @@ use PhpAmqpLib\Wire\AMQPWriter;
 
 class StreamIO extends AbstractIO
 {
-    const READ_BUFFER_WAIT_INTERVAL = 100000;
+    const READ_BUFFER_WAIT_INTERVAL = 500000; // 0.5 second
+    // 0.5 * 60 = 30 seconds, chosen because RabbitMQ's default
+    // socket read / write timeout is also 30 seconds
+    const READ_BUFFER_MAX_ATTEMPTS  = 60;
 
     /** @var string */
     protected $protocol;
@@ -209,9 +212,24 @@ class StreamIO extends AbstractIO
     {
         $this->check_heartbeat();
 
+        if ($this->heartbeat > 0) {
+            # heartbeat is in seconds, we want to have enough read
+            # attempts to give the heartbeat mechanism a chance to work.
+            # If heartbeat is enabled we should wait at least 2x the
+            # heartbeat value in seconds, which is why we multiply by
+            # 4 here
+            $read_attempts = $this->heartbeat * 4;
+        } else {
+            $read_attempts = self::READ_BUFFER_MAX_ATTEMPTS;
+        }
+
+        list($timeout_sec, $timeout_uSec) =
+            MiscHelper::splitSecondsMicroseconds($this->read_write_timeout);
+
         $read = 0;
         $data = '';
 
+        $wait_buffer_count = 0;
         while ($read < $len) {
             if (!is_resource($this->sock) || feof($this->sock)) {
                 throw new AMQPRuntimeException('Broken pipe or closed connection');
@@ -231,15 +249,19 @@ class StreamIO extends AbstractIO
             }
 
             if ($buffer === '') {
-                if ($this->canDispatchPcntlSignal) {
-                    $this->select(0, self::READ_BUFFER_WAIT_INTERVAL);
-                    pcntl_signal_dispatch();
-                } else {
-                    $this->check_heartbeat();
+                $read_attempts--;
+                if ($read_attempts == 0) {
+                    throw new AMQPTimeoutException('Too many read attempts detected in StreamIO');
                 }
+                $this->select($timeout_sec, $timeout_uSec);
+                if ($this->canDispatchPcntlSignal) {
+                    pcntl_signal_dispatch();
+                }
+                $this->check_heartbeat();
                 continue;
             }
 
+            $this->last_read = microtime(true);
             $read += mb_strlen($buffer, 'ASCII');
             $data .= $buffer;
         }
@@ -254,7 +276,6 @@ class StreamIO extends AbstractIO
             );
         }
 
-        $this->last_read = microtime(true);
         return $data;
     }
 
